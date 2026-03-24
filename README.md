@@ -4,7 +4,7 @@
 
 A desktop application for creating `.funscript` files from audio/video files. Automatically detects beats in music and generates synchronized haptic feedback scripts for devices like The Handy.
 
-<img width="1535" height="1030" alt="preview" src="https://github.com/user-attachments/assets/6bdd0ffe-a81a-45c5-8fed-ecc926e7054b" />
+<img width="1535" height="1030" alt="preview" src="https://github.com/user-attachments/assets/888b2b29-096f-472b-b386-2f5e2a3d3257" />
 
 ## Features
 
