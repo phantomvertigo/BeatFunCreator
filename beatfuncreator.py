@@ -1081,11 +1081,21 @@ class App:
         self._playing = False
         self._play_start_pos = 0
         self._play_end_pos = 0
-        self._play_stream = None        # sd.OutputStream for sample-accurate position
+        self._play_stream = None        # persistent sd.OutputStream
         self._play_sample_idx = 0       # current sample index in the chunk
         self._play_chunk = None         # audio chunk being played
+        self._play_speed = 1.0          # speed used for current chunk
         self._playhead_pos = 0  # current playhead in seconds (persists after stop)
         self._playback_speed = 1.0  # playback speed multiplier
+        self._audio_volume = 1.0       # media audio volume (0.0–1.0)
+        self._stretched_cache = None    # (speed, y_hash, stretched_array)
+        self._stretching = False        # background stretch in progress
+        self._beat_sound_data = None    # pre-loaded beat sound samples (numpy array)
+        self._beat_sound_enabled = False
+        self._beat_sound_volume = 0.5
+        self._beat_sample_offsets = []  # sorted list of sample offsets in chunk where beats occur
+        self._beat_sound_pos = -1       # current playback position within beat sound (-1 = idle)
+        self._next_beat_list_idx = 0    # index into _beat_sample_offsets for next beat to trigger
         self._video_window = None   # Toplevel for video preview
         self._video_cap = None      # cv2.VideoCapture
         self._video_fps = 30.0      # video frame rate
@@ -1503,8 +1513,11 @@ class App:
                      state="readonly").pack(side="right", padx=(2, 4))
         ttk.Label(frame_edit_row1, text="Snap:").pack(side="right", padx=(4, 0))
         self.snap_strength = tk.DoubleVar(value=0.5)
+        self._snap_radius_label = tk.StringVar(value="50%")
+        ttk.Label(frame_edit_row1, textvariable=self._snap_radius_label, width=5).pack(side="right", padx=(0, 2))
         ttk.Scale(frame_edit_row1, from_=0.05, to=1.0, variable=self.snap_strength,
-                  length=60).pack(side="right", padx=2)
+                  length=60,
+                  command=lambda v: self._snap_radius_label.set(f"{int(float(v) * 100)}%")).pack(side="right", padx=2)
         ttk.Label(frame_edit_row1, text="Snap radius:").pack(side="right")
         # Sync snap_to_spike bool from snap_mode for backward compat
         def _sync_snap_mode(*_):
@@ -1577,7 +1590,7 @@ class App:
         frame_time = ttk.Frame(right)
         frame_time.pack(fill="x")
         tk.Label(frame_time,
-                 text="Space = play/pause | Click = seek | ←→ = ±0.1s | Ctrl+←→ = ±1s | Home/End",
+                 text="Space = play/pause | B = add beat | Click = seek | ←→ = ±0.1s | Ctrl+←→ = ±1s | Home/End",
                  fg="gray", font=("Segoe UI", 7),
                  anchor="e").pack(side="right", padx=4)
         # Playback speed slider (0.1x – 3.0x)
@@ -1590,10 +1603,36 @@ class App:
             command=lambda v: self._on_speed_slider(float(v)))
         self._speed_scale.pack(side="left", padx=(0, 2))
         ttk.Label(frame_time, textvariable=self._speed_label_var, width=4).pack(
-            side="left", padx=(0, 6))
+            side="left", padx=(0, 4))
+        # Play / Pause toggle button
+        self._play_pause_var = tk.StringVar(value="\u25B6")
+        self._btn_play_pause = ttk.Button(frame_time, textvariable=self._play_pause_var,
+                                           width=3, command=self._toggle_play_pause)
+        self._btn_play_pause.pack(side="left", padx=(0, 4))
         # Video preview button
         self._video_btn = ttk.Button(frame_time, text="Video", command=self._toggle_video_window)
         self._video_btn.pack(side="left", padx=(0, 4))
+        # Audio volume slider
+        self._audio_vol_dvar = tk.DoubleVar(value=1.0)
+        self._audio_vol_label = tk.StringVar(value="100%")
+        ttk.Label(frame_time, text="Volume:").pack(side="left", padx=(4, 1))
+        ttk.Scale(frame_time, from_=0.0, to=1.0, variable=self._audio_vol_dvar,
+                  orient="horizontal", length=50,
+                  command=self._on_audio_vol).pack(side="left", padx=(0, 1))
+        ttk.Label(frame_time, textvariable=self._audio_vol_label, width=5).pack(
+            side="left", padx=(0, 4))
+        # Beat sound toggle + volume (separated with extra padding)
+        self._beat_sound_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frame_time, text="Beat Sound",
+                        variable=self._beat_sound_var,
+                        command=self._on_beat_sound_toggle).pack(side="left", padx=(12, 1))
+        self._beat_vol_dvar = tk.DoubleVar(value=0.5)
+        self._beat_vol_label = tk.StringVar(value="50%")
+        ttk.Scale(frame_time, from_=0.0, to=2.0, variable=self._beat_vol_dvar,
+                  orient="horizontal", length=50,
+                  command=self._on_beat_vol).pack(side="left", padx=(4, 1))
+        ttk.Label(frame_time, textvariable=self._beat_vol_label, width=5).pack(
+            side="left", padx=(0, 4))
 
         # Make canvas focusable
         self.canvas.get_tk_widget().config(takefocus=True)
@@ -1616,6 +1655,8 @@ class App:
         self.canvas.get_tk_widget().bind("<Control-v>", lambda e: self._paste_all())
         self.canvas.get_tk_widget().bind("<Control-z>", lambda e: self._undo())
         self.canvas.get_tk_widget().bind("<Control-y>", lambda e: self._redo())
+        root.bind("<b>", self._on_key_b)
+        root.bind("<B>", self._on_key_b)
 
         # Track modifier keys at root level so they work even before canvas gets focus
         root.bind("<KeyPress-Shift_L>", lambda e: self._set_mod("shift", True))
@@ -1702,7 +1743,9 @@ class App:
             self.snap_first_only.set(bool(cfg["snap_first_only"]))
         if "snap_strength" in cfg:
             try:
-                self.snap_strength.set(float(cfg["snap_strength"]))
+                val = float(cfg["snap_strength"])
+                self.snap_strength.set(val)
+                self._snap_radius_label.set(f"{int(val * 100)}%")
             except (ValueError, TypeError):
                 pass
         if "beat_intensity" in cfg:
@@ -1786,7 +1829,7 @@ class App:
         cfg["tempo_timesig"] = self.tempo_timesig_var.get()
         cfg["tempo_subdiv"] = self.tempo_subdiv_var.get()
         _save_config(cfg)
-        self._stop_playback()
+        self._close_stream()
         self.root.destroy()
 
     def _show_about(self):
@@ -1903,7 +1946,7 @@ class App:
 
     def _set_file(self, path):
         self._auto_stop_tap_recording()
-        self._stop_playback()
+        self._close_stream()
         self._close_video_window()
         self.file_path.set(path)
         if not self.out_dir.get():
@@ -1938,6 +1981,10 @@ class App:
                 self.tmp_audio = audio_path
 
             y_raw, self.sr = load_audio(audio_path, self._progress_cb)
+            # Regenerate beat click at correct sample rate
+            self._beat_sound_data = None
+            if self._beat_sound_enabled:
+                self._generate_beat_sound()
             self.y_raw = y_raw
             if self.auto_normalize.get():
                 pct = self.norm_percentile.get()
@@ -2011,6 +2058,23 @@ class App:
 
     # ── Playback ──
 
+    def _toggle_play_pause(self):
+        if self.y is None:
+            return
+        if self._playing:
+            self._stop_playback()
+        else:
+            self._start_playback()
+
+    def _on_key_b(self, event):
+        """Add a beat at the current playhead position."""
+        if isinstance(event.widget, (ttk.Entry, tk.Entry)):
+            return
+        if self.y is None:
+            return
+        pos = self._get_playhead_pos() if self._playing else self._playhead_pos
+        self._add_beat_at(pos, snap=True)
+
     def _on_space(self, event):
         if isinstance(event.widget, (ttk.Entry, tk.Entry)):
             return
@@ -2048,38 +2112,140 @@ class App:
         if len(audio_chunk) == 0:
             return
 
+        # Time-stretch for speed change without pitch shift
+        speed = self._playback_speed
+        if abs(speed - 1.0) > 0.01:
+            audio_chunk = self._get_stretched(audio_chunk, speed)
+
         self._playing = True
+        self._play_pause_var.set("\u23F8")
         self._play_start_pos = start_pos
         self._play_end_pos = out_sec
         self._play_chunk = audio_chunk
         self._play_sample_idx = 0
+        self._play_speed = speed
 
-        # Use OutputStream with callback for sample-accurate position tracking
-        def _audio_callback(outdata, frames, time_info, status):
-            idx = self._play_sample_idx
-            end = idx + frames
-            if end <= len(self._play_chunk):
-                outdata[:, 0] = self._play_chunk[idx:end]
-                self._play_sample_idx = end
-            else:
-                # Fill remaining with silence, signal stop
-                remaining = len(self._play_chunk) - idx
-                if remaining > 0:
-                    outdata[:remaining, 0] = self._play_chunk[idx:]
-                outdata[max(0, remaining):] = 0
-                self._play_sample_idx = len(self._play_chunk)
-                raise sd.CallbackStop()
+        # Precompute beat sample offsets within the chunk for sample-accurate beat sound
+        self._beat_sample_offsets = []
+        self._beat_sound_pos = -1
+        self._next_beat_list_idx = 0
+        if self._beat_sound_enabled and self.beats_ms:
+            chunk_len = len(audio_chunk)
+            for b_ms in self.beats_ms:
+                # Convert beat time to sample offset within the chunk
+                beat_sec = b_ms / 1000.0
+                sample_in_orig = (beat_sec - start_pos) / speed * self.sr
+                sample_idx = int(round(sample_in_orig))
+                if 0 <= sample_idx < chunk_len:
+                    self._beat_sample_offsets.append(sample_idx)
 
-        self._play_stream = sd.OutputStream(
-            samplerate=int(self.sr * self._playback_speed), channels=1,
-            dtype='float32', callback=_audio_callback)
-        self._play_stream.start()
+        # Reuse persistent stream or create one
+        self._ensure_stream()
         self._tick_playhead()
 
-    def _stop_playback(self):
-        if self._playing:
-            # Save current position from sample counter
-            self._playhead_pos = self._get_playhead_pos()
+    def _ensure_stream(self):
+        """Create or verify the persistent audio output stream."""
+        if self._play_stream is not None and self._play_stream.active:
+            return
+        # Close stale stream
+        if self._play_stream is not None:
+            try:
+                self._play_stream.close()
+            except Exception:
+                pass
+
+        def _audio_callback(outdata, frames, time_info, status):
+            if not self._playing or self._play_chunk is None:
+                outdata[:] = 0
+                return
+            idx = self._play_sample_idx
+            end = idx + frames
+            chunk = self._play_chunk
+            av = self._audio_volume
+            if end <= len(chunk):
+                outdata[:, 0] = chunk[idx:end] * av
+                self._play_sample_idx = end
+            else:
+                remaining = len(chunk) - idx
+                if remaining > 0:
+                    outdata[:remaining, 0] = chunk[idx:] * av
+                outdata[max(0, remaining):] = 0
+                self._play_sample_idx = len(chunk)
+
+            # Mix beat sound at exact sample positions
+            bs = self._beat_sound_data
+            if bs is None or not self._beat_sound_enabled:
+                return
+            offsets = self._beat_sample_offsets
+            vol = self._beat_sound_volume
+            bs_len = len(bs)
+            # _beat_sound_pos tracks how many samples of the beat sound
+            # have been consumed (-1 means no beat sound is playing)
+            bp = self._beat_sound_pos
+            nbi = self._next_beat_list_idx
+            buf_start = idx  # first sample index of this buffer in the chunk
+
+            # Find all beats that trigger within this buffer [buf_start, buf_start+frames)
+            # Each new beat resets playback to the start of the beat sound
+            triggers = []
+            while nbi < len(offsets) and offsets[nbi] < buf_start + frames:
+                if offsets[nbi] >= buf_start:
+                    triggers.append(offsets[nbi] - buf_start)  # offset within buffer
+                nbi += 1
+            self._next_beat_list_idx = nbi
+
+            if not triggers and bp < 0:
+                return  # no active beat sound and no new triggers
+
+            # Process the buffer in segments, restarting beat sound at each trigger
+            cursor = 0  # position within output buffer
+            for trig in triggers:
+                # Continue existing beat sound up to trigger point
+                if bp >= 0 and bp < bs_len and trig > cursor:
+                    n = min(trig - cursor, bs_len - bp)
+                    outdata[cursor:cursor + n, 0] += bs[bp:bp + n] * vol
+                # Reset beat sound at trigger point
+                bp = 0
+                cursor = trig
+
+            # Continue beat sound for remainder of buffer after last trigger
+            if bp >= 0 and bp < bs_len:
+                remaining_buf = frames - cursor
+                n = min(remaining_buf, bs_len - bp)
+                if n > 0:
+                    outdata[cursor:cursor + n, 0] += bs[bp:bp + n] * vol
+                bp += remaining_buf
+                if bp >= bs_len:
+                    bp = -1  # beat sound finished
+
+            self._beat_sound_pos = bp
+
+        self._play_stream = sd.OutputStream(
+            samplerate=self.sr, channels=1,
+            dtype='float32', latency='low',
+            callback=_audio_callback)
+        self._play_stream.start()
+
+    def _get_stretched(self, chunk, speed):
+        """Return time-stretched audio, using cache when possible."""
+        # Check cache: same speed and same audio identity
+        cache = self._stretched_cache
+        if cache is not None:
+            c_speed, c_id, c_start, c_end, c_data = cache
+            if (abs(c_speed - speed) < 0.01
+                    and c_id is self.y
+                    and c_start == id(chunk)
+                    and c_end == len(chunk)):
+                return c_data
+        try:
+            stretched = librosa.effects.time_stretch(chunk, rate=speed)
+        except Exception:
+            stretched = chunk
+        self._stretched_cache = (speed, self.y, id(chunk), len(chunk), stretched)
+        return stretched
+
+    def _close_stream(self):
+        """Fully close the audio stream (for app exit or file change)."""
         self._playing = False
         if self._play_stream is not None:
             try:
@@ -2089,6 +2255,44 @@ class App:
                 pass
             self._play_stream = None
         self._play_chunk = None
+        self._stretched_cache = None
+
+    def _on_audio_vol(self, val):
+        v = float(val)
+        self._audio_volume = v
+        self._audio_vol_label.set(f"{int(v * 100)}%")
+
+    def _on_beat_vol(self, val):
+        v = float(val)
+        self._beat_sound_volume = v
+        self._beat_vol_label.set(f"{int(v * 100)}%")
+
+    def _on_beat_sound_toggle(self):
+        self._beat_sound_enabled = self._beat_sound_var.get()
+        if self._beat_sound_enabled and self._beat_sound_data is None:
+            self._generate_beat_sound()
+
+    def _generate_beat_sound(self, sr=None):
+        """Synthesize a short click sound with zero leading silence."""
+        import numpy as np
+        sr = sr or self.sr or 44100
+        # Short exponentially-decaying sine wave — starts at sample 0
+        duration = 0.04  # 40 ms total
+        n = int(sr * duration)
+        t = np.linspace(0, duration, n, endpoint=False, dtype='float32')
+        freq = 1200.0  # Hz — crisp click tone
+        decay = 80.0   # higher = faster decay
+        click = np.sin(2.0 * np.pi * freq * t) * np.exp(-decay * t)
+        self._beat_sound_data = click.astype('float32')
+
+
+    def _stop_playback(self):
+        if self._playing:
+            # Save current position from sample counter
+            self._playhead_pos = self._get_playhead_pos()
+        self._playing = False
+        self._play_pause_var.set("\u25B6")
+        # Keep stream alive — it outputs silence when not playing
         if self._playhead_timer is not None:
             self.root.after_cancel(self._playhead_timer)
             self._playhead_timer = None
@@ -2201,27 +2405,55 @@ class App:
             self._video_window = None
         self._video_label = None
         self._video_last_frame_sec = -1
+        self._video_frame_no = -1
+        self._video_pending_photo = None
 
     def _update_video_frame(self, pos_sec):
         """Show the video frame at pos_sec in the preview window."""
         if self._video_cap is None or self._video_label is None:
             return
-        # Avoid redundant seeks for the same frame
-        frame_dur = 1.0 / self._video_fps
-        if abs(pos_sec - self._video_last_frame_sec) < frame_dur * 0.4:
+        # Determine target frame number
+        target_frame = int(pos_sec * self._video_fps)
+        if target_frame == getattr(self, '_video_frame_no', -1):
             return
         self._video_last_frame_sec = pos_sec
+
+        try:
+            import cv2
+        except ImportError:
+            return
+
+        cap = self._video_cap
+        cur_frame = getattr(self, '_video_frame_no', -1)
+
+        # Sequential read if playing forward and within a few frames
+        gap = target_frame - cur_frame
+        if 0 < gap <= 3:
+            # Skip intermediate frames by reading without decoding
+            for _ in range(gap - 1):
+                cap.grab()
+            ret, frame = cap.read()
+        else:
+            # Seek for large jumps or backward movement
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+            ret, frame = cap.read()
+
+        if not ret:
+            return
+        self._video_frame_no = target_frame
+
+        # Resize and display — run in background thread to avoid UI stutter
+        Thread(target=self._render_video_frame, args=(frame,), daemon=True).start()
+
+    def _render_video_frame(self, frame):
+        """Resize and convert a video frame, then schedule display on main thread."""
         try:
             import cv2
             from PIL import Image, ImageTk
         except ImportError:
             return
-        self._video_cap.set(cv2.CAP_PROP_POS_MSEC, pos_sec * 1000)
-        ret, frame = self._video_cap.read()
-        if not ret:
-            return
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # Use window size for dynamic resizing, maintain aspect ratio
+        # Compute display size from window dimensions, maintaining aspect ratio
         try:
             win_w = self._video_window.winfo_width()
             win_h = self._video_window.winfo_height()
@@ -2240,14 +2472,28 @@ class App:
         frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_AREA)
         img = Image.fromarray(frame)
         photo = ImageTk.PhotoImage(img)
+        # Schedule the label update on the main thread
+        self._video_pending_photo = photo
+        try:
+            self.root.after_idle(self._apply_video_photo)
+        except Exception:
+            pass
+
+    def _apply_video_photo(self):
+        """Apply the latest rendered video frame to the label (main thread)."""
+        photo = self._video_pending_photo
+        if photo is None or self._video_label is None:
+            return
         self._video_label.config(image=photo)
-        self._video_label._photo = photo  # prevent garbage collection
+        self._video_label._photo = photo
 
     def _get_playhead_pos(self):
         if not self._playing:
             return self._playhead_pos
-        # Sample-accurate position from the audio callback counter
-        elapsed_sec = self._play_sample_idx / self.sr
+        # The stretched chunk plays at original sr but each sample covers
+        # speed× real time, so elapsed real time = samples / sr × speed
+        speed = getattr(self, '_play_speed', 1.0)
+        elapsed_sec = self._play_sample_idx / self.sr * speed
         return min(self._play_start_pos + elapsed_sec, self._play_end_pos)
 
     def _tick_playhead(self):
@@ -2256,10 +2502,10 @@ class App:
 
         pos = self._get_playhead_pos()
 
-        # Check if stream finished naturally
-        stream_done = (self._play_stream is not None
-                       and not self._play_stream.active)
-        if stream_done or pos >= self._play_end_pos:
+        # Check if chunk is exhausted or position reached end
+        chunk_done = (self._play_chunk is not None
+                      and self._play_sample_idx >= len(self._play_chunk))
+        if chunk_done or pos >= self._play_end_pos:
             self._playhead_pos = self._play_end_pos
             self._stop_playback()
             self._update_playhead_position(self._playhead_pos)
@@ -2273,6 +2519,7 @@ class App:
         self.time_var.set(
             f"{_format_time_ms(pos)} / {_format_time_ms(self.duration)}")
         self._update_video_frame(pos)
+
 
         # Auto-scroll when playhead exits view
         xlim = self.ax_wave.get_xlim()
@@ -2895,6 +3142,25 @@ class App:
                 linestyle=":", zorder=11)
             self._multi_beat_preview_artists.append(line)
 
+    def _deselect_all(self):
+        """Clear all selections (beats, keyframes, zones) and redraw."""
+        need_redraw = False
+        if self._selected_beats:
+            self._selected_beats.clear()
+            self._draw_beat_lod()
+            need_redraw = True
+        if self._selected_kf:
+            self._selected_kf.clear()
+            self._draw_fun_lod()
+            need_redraw = True
+        if self._selected_zone_idx is not None:
+            self._selected_zone_idx = None
+            self._draw_zones_lod()
+            need_redraw = True
+        if need_redraw:
+            self.canvas.draw_idle()
+            self.status.set("Selection cleared")
+
     def _start_selection_rect(self, x_data, y_pixel):
         """Begin drawing an RTS-style selection rectangle."""
         self._selection_start_xy = (x_data, y_pixel)
@@ -2980,15 +3246,15 @@ class App:
         """Snap to nearest peak or musical beat depending on snap_mode.
         Snap strength controls the search radius (0.05=tight, 1.0=wide).
         Holding Ctrl or Shift while dragging temporarily disables snapping."""
-        if self._dragging is not None and (self._mod_ctrl or self._mod_shift):
+        if self._mod_shift:
+            return x_sec
+        if self._dragging is not None and self._mod_ctrl:
             return x_sec
         mode = self.snap_mode.get()
         if mode == "Off":
             return x_sec
 
-        xlim = self.ax_wave.get_xlim()
-        strength = self.snap_strength.get()
-        radius = max(0.01, (xlim[1] - xlim[0]) * 0.05 * strength)
+        radius = max(0.01, self.snap_strength.get())
 
         if mode == "Musical Beat":
             if self._tempo_grid_times is None or len(self._tempo_grid_times) == 0:
@@ -4698,6 +4964,9 @@ class App:
                 pass
 
         if event.inaxes not in (self.ax_wave, self.ax_fun, self.ax_zones) and x_data is None:
+            # Click on dark canvas area outside axes — deselect all
+            if event.button == 1:
+                self._deselect_all()
             return
 
         # Middle mouse button
@@ -5146,7 +5415,7 @@ class App:
                     self._selection_rect_artist = Rectangle(
                         (left, bottom), right - left, top - bottom,
                         fill=True, facecolor="#7aa2f7", alpha=0.15,
-                        edgecolor="#7aa2f7", linewidth=1, zorder=20)
+                        edgecolor="#7aa2f7", linewidth=1, linestyle="--", zorder=20)
                     self.ax_fun.add_patch(self._selection_rect_artist)
                     self._draw_fun_lod()
                     self.canvas.draw_idle()
@@ -5436,14 +5705,16 @@ class App:
             self._draw_fun_lod()
             self.canvas.draw_idle()
         if self._dragging == "mmb_pan":
-            if not self._mmb_did_pan and self._mmb_pan_click_data is not None:
-                # No drag occurred — seek playhead to click position (with snapping)
-                click_pos = max(0, self._mmb_pan_click_data)
-                if self.duration > 0:
-                    click_pos = min(click_pos, self.duration)
-                if self.snap_to_spike.get():
-                    click_pos = self._snap_to_spike(click_pos)
-                self._seek_to(click_pos)
+            if not self._mmb_did_pan:
+                # No drag occurred — clear all selections and seek
+                self._deselect_all()
+                if self._mmb_pan_click_data is not None:
+                    click_pos = max(0, self._mmb_pan_click_data)
+                    if self.duration > 0:
+                        click_pos = min(click_pos, self.duration)
+                    if self.snap_to_spike.get():
+                        click_pos = self._snap_to_spike(click_pos)
+                    self._seek_to(click_pos)
             self._mmb_pan_start_x = None
             self._mmb_pan_start_xlim = None
             self._mmb_pan_click_data = None
